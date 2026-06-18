@@ -1,6 +1,7 @@
 from dataclasses import asdict, dataclass
 from functools import partial
 from math import ceil
+import time
 from typing import Optional
 
 import tiktoken
@@ -29,6 +30,7 @@ class Turn:
     images: list[str] = None
     input_tokens: int = 0
     output_tokens: int = 0
+    elapsed_ms: int = 0
     embedding: Tensor = None
 
     def to_dict(self):
@@ -144,6 +146,7 @@ class Agent:
         history_msg = []
         for turn in history:
             history_msg.extend(turn.message)
+        started_at = time.monotonic()
         response, message = self.llm(
             prompt,
             history=history_msg,
@@ -155,6 +158,7 @@ class Agent:
             response=response,
             message=message,
             retry=error_idx,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
         )
         return self.__post_process__(response, history, turn)
 
@@ -227,6 +231,7 @@ class Agent:
         for turn in history:
             history_msg.extend(turn.message)
 
+        started_at = time.monotonic()
         response, message = self.llm(
             prompt,
             system_message=self.system_message,
@@ -240,6 +245,7 @@ class Agent:
             response=response,
             message=message,
             images=images,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
         )
         return turn.id, self.__post_process__(response, history, turn, similar)
 
@@ -287,6 +293,7 @@ class AsyncAgent(Agent):
         history_msg = []
         for turn in history:
             history_msg.extend(turn.message)
+        started_at = time.monotonic()
         response, message = await self.llm(
             prompt,
             history=history_msg,
@@ -298,6 +305,7 @@ class AsyncAgent(Agent):
             response=response,
             message=message,
             retry=error_idx,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
         )
         return await self.__post_process__(response, history, turn)
 
@@ -331,6 +339,7 @@ class AsyncAgent(Agent):
         for turn in history:
             history_msg.extend(turn.message)
 
+        started_at = time.monotonic()
         response, message = await self.llm(
             prompt,
             system_message=self.system_message,
@@ -344,6 +353,7 @@ class AsyncAgent(Agent):
             response=response,
             message=message,
             images=images,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
         )
         return turn.id, await self.__post_process__(response, history, turn, similar)
 

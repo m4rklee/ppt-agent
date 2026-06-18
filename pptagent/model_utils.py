@@ -17,7 +17,18 @@ from pptagent.llms import LLM, AsyncLLM
 from pptagent.presentation import Presentation, SlidePage
 from pptagent.utils import get_logger, is_image_path, pjoin
 
+# 个别算子在 MPS 上不支持时回退到 CPU，避免 marker/surya 在 Apple GPU 上报错
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 logger = get_logger(__name__)
+
+
+def select_torch_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 class ModelManager:
@@ -43,7 +54,7 @@ class ModelManager:
             text_model_name = os.environ.get("TEXT_MODEL", "text-embedding-3-small")
         self._image_model = None
         self._marker_model = None
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = select_torch_device()
 
         self.language_model = AsyncLLM(language_model_name, api_base)
         self.vision_model = AsyncLLM(vision_model_name, api_base)
@@ -58,9 +69,9 @@ class ModelManager:
     @property
     def marker_model(self):
         if self._marker_model is None:
-            self._marker_model = create_model_dict(
-                device=self.device, dtype=torch.float16
-            )
+            # CPU 上 float16 反而更慢，仅 GPU(cuda/mps) 用 float16
+            dtype = torch.float16 if self.device in ("cuda", "mps") else torch.float32
+            self._marker_model = create_model_dict(device=self.device, dtype=dtype)
         return self._marker_model
 
     async def test_connections(self) -> bool:
@@ -119,18 +130,18 @@ def get_image_model(device: str = None):
         tuple: A tuple containing the feature extractor and the image model.
     """
     model_base = "google/vit-base-patch16-224-in21k"
+    # 统一 float32 + 显式 .to(device)，适配 MPS 并避免与 float32 像素输入 dtype 不匹配
     return (
         AutoProcessor.from_pretrained(
             model_base,
-            torch_dtype=torch.float16,
-            device_map=device,
             use_fast=True,
         ),
         AutoModel.from_pretrained(
             model_base,
-            torch_dtype=torch.float16,
-            device_map=device,
-        ).eval(),
+            torch_dtype=torch.float32,
+        )
+        .to(device)
+        .eval(),
     )
 
 

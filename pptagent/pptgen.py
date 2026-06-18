@@ -22,6 +22,22 @@ style = StyleArg.all_true()
 style.area = False
 
 
+def summarize_agent_perf(agents: dict[str, list]) -> dict[str, dict]:
+    """Summarize per-agent elapsed time and retry counts from turn history."""
+    perf: dict[str, dict] = {}
+    for name, turns in agents.items():
+        if not turns:
+            continue
+        perf[name] = {
+            "elapsed_ms": sum(int(turn.get("elapsed_ms", 0) or 0) for turn in turns),
+            "turns": len(turns),
+            "retries": sum(
+                1 for turn in turns if int(turn.get("retry", -1) or -1) > 0
+            ),
+        }
+    return perf
+
+
 class FunctionalLayouts(Enum):
     OPENING = "opening"
     TOC = "table of contents"
@@ -56,9 +72,11 @@ class PPTGen(ABC):
     record_cost: bool = False
     length_factor: float | None = None
     _initialized: bool = False
+    _outline_planner_role: str = "planner"
 
     def __post_init__(self):
         self._initialized = False
+        self._outline_planner_role = "planner"
         self._hire_staffs(self.record_cost, self.language_model, self.vision_model)
         assert (
             self.length_factor is None or self.length_factor > 0
@@ -180,24 +198,26 @@ class PPTGen(ABC):
 
     def generate_outline(
         self,
-        num_slides: int,
+        num_slides: Optional[int],
         source_doc: Document,
     ):
         """
         Generate an outline for the presentation.
 
         Args:
-            num_slides (int): The number of slides to generate.
+            num_slides (Optional[int]): Target slide count, or None for auto mode.
 
         Returns:
             dict: The generated outline.
         """
         assert self._initialized, "PPTGen not initialized, call `set_reference` first"
-        turn_id, outline = self.staffs["planner"](
-            num_slides=num_slides,
-            document_overview=source_doc.get_overview(),
-        )
-        if num_slides == 1 and isinstance(outline, dict):
+        planner_role = "planner" if num_slides is not None else "planner_auto"
+        self._outline_planner_role = planner_role
+        kwargs = {"document_overview": source_doc.get_overview()}
+        if num_slides is not None:
+            kwargs["num_slides"] = num_slides
+        turn_id, outline = self.staffs[planner_role](**kwargs)
+        if isinstance(outline, dict):
             outline = [outline]
         outline = self._fix_outline(outline, source_doc, turn_id)
         return self._add_functional_layouts(outline)
@@ -312,7 +332,7 @@ class PPTGen(ABC):
             )
             logger.debug(traceback.format_exc())
             if retry < self.retry_times:
-                new_outline = self.staffs["planner"].retry(
+                new_outline = self.staffs[self._outline_planner_role].retry(
                     str(e), traceback.format_exc(), turn_id, retry
                 )
                 return self._fix_outline(new_outline, source_doc, turn_id, retry)
@@ -373,7 +393,7 @@ class PPTGen(ABC):
                 text_model=self.text_embedder,
                 llm_mapping=llm_mapping,
             )
-            for role in ["planner"] + self.roles
+            for role in ["planner", "planner_auto"] + self.roles
         }
 
 
@@ -457,28 +477,38 @@ class PPTGenAsync(PPTGen):
         async def generate_slide_wrapped(
             slide_idx: int, outline_item: OutlineItem
         ):
+            slide_started = time.monotonic()
             lens_before = self._staff_history_lens()
             try:
                 result = await self.generate_slide(slide_idx, outline_item)
+                agents = self._slice_staff_history(lens_before)
                 slide_trace: dict[str, Any] = {
                     "index": slide_idx + 1,
                     "purpose": outline_item.purpose,
                     "section": outline_item.section,
-                    "agents": self._slice_staff_history(lens_before),
+                    "elapsed_ms": int((time.monotonic() - slide_started) * 1000),
+                    "agents": agents,
+                    "agent_perf": summarize_agent_perf(agents),
                 }
                 if result is not None:
                     _, code_executor = result
                     slide_trace["code_history"] = code_executor.code_history
                     slide_trace["api_history"] = code_executor.api_history
+                    slide_trace["code_retries"] = max(
+                        0, len(code_executor.code_history) - 1
+                    )
                 per_slide_traces.append(slide_trace)
                 await notify("agent_turn", slide_trace)
                 return slide_idx, outline_item, result, None
             except Exception as e:
+                agents = self._slice_staff_history(lens_before)
                 slide_trace = {
                     "index": slide_idx + 1,
                     "purpose": outline_item.purpose,
                     "section": outline_item.section,
-                    "agents": self._slice_staff_history(lens_before),
+                    "elapsed_ms": int((time.monotonic() - slide_started) * 1000),
+                    "agents": agents,
+                    "agent_perf": summarize_agent_perf(agents),
                     "error": str(e),
                 }
                 per_slide_traces.append(slide_trace)
@@ -508,6 +538,30 @@ class PPTGenAsync(PPTGen):
                     "section": outline_item.section,
                     "success": success,
                     "error": str(error) if error else None,
+                    "elapsed_ms": next(
+                        (
+                            trace["elapsed_ms"]
+                            for trace in per_slide_traces
+                            if trace["index"] == slide_idx + 1
+                        ),
+                        None,
+                    ),
+                    "agent_perf": next(
+                        (
+                            trace.get("agent_perf")
+                            for trace in per_slide_traces
+                            if trace["index"] == slide_idx + 1
+                        ),
+                        None,
+                    ),
+                    "code_retries": next(
+                        (
+                            trace.get("code_retries", 0)
+                            for trace in per_slide_traces
+                            if trace["index"] == slide_idx + 1
+                        ),
+                        0,
+                    ),
                 },
             )
             slide_results_by_idx[slide_idx] = (result, error)
@@ -542,7 +596,7 @@ class PPTGenAsync(PPTGen):
 
     async def generate_outline(
         self,
-        num_slides: int,
+        num_slides: Optional[int],
         source_doc: Document,
     ):
         """
@@ -552,13 +606,15 @@ class PPTGenAsync(PPTGen):
             self._initialized
         ), "AsyncPPTAgent not initialized, call `set_reference` first"
 
-        turn_id, outline = await self.staffs["planner"]( # 根据结构化文档内容生成演示文稿大纲
-            num_slides=num_slides,
-            document_overview=source_doc.get_overview(),
-        )
-        if num_slides == 1 and isinstance(outline, dict):
+        planner_role = "planner" if num_slides is not None else "planner_auto"
+        self._outline_planner_role = planner_role
+        kwargs = {"document_overview": source_doc.get_overview()}
+        if num_slides is not None:
+            kwargs["num_slides"] = num_slides
+        turn_id, outline = await self.staffs[planner_role](**kwargs)
+        if isinstance(outline, dict):
             outline = [outline]
-        outline = await self._fix_outline(outline, source_doc, turn_id) # 验证outline
+        outline = await self._fix_outline(outline, source_doc, turn_id)
         return self._add_functional_layouts(outline)
 
     @abstractmethod
@@ -599,7 +655,7 @@ class PPTGenAsync(PPTGen):
             )
             logger.debug(traceback.format_exc())
             if retry < self.retry_times:
-                new_outline = await self.staffs["planner"].retry(
+                new_outline = await self.staffs[self._outline_planner_role].retry(
                     str(e), traceback.format_exc(), turn_id, retry
                 )
                 return await self._fix_outline(new_outline, source_doc, turn_id, retry)

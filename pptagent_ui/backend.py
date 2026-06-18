@@ -36,12 +36,13 @@ from pptagent.utils import Config, get_logger, is_image_path, package_join, pjoi
 # constants
 DEBUG = True if len(sys.argv) == 1 else False
 RUNS_DIR = os.path.abspath('..') + "/runs"
+PDF_PARSE_TIMEOUT_SEC = float(os.environ.get("PDF_PARSE_TIMEOUT_SEC", "600"))
 
 PIPELINE_STAGES = [
     {
         "id": "init",
         "label": "任务初始化",
-        "inputs": ["上传 PDF/PPTX", "目标页数"],
+        "inputs": ["上传 PDF/PPTX", "目标页数或自动"],
         "outputs": ["task.json"],
         "artifacts": ["task"],
         "agents": [],
@@ -125,6 +126,48 @@ STAGE_TRACE_FILES = {
 }
 
 TRACE_TEXT_LIMIT = 8192
+
+
+def aggregate_slide_gen_perf(
+    slides: list[dict], traces: list[dict] | None = None
+) -> dict:
+    """Aggregate per-slide and per-agent timing from slide_gen progress data."""
+    traces = traces or []
+    agent_totals: dict[str, dict] = {}
+    per_slide: list[dict] = []
+    total_elapsed = 0
+    total_code_retries = 0
+
+    for slide in slides:
+        idx = slide.get("index")
+        trace = next((t for t in traces if t.get("index") == idx), {})
+        elapsed = slide.get("elapsed_ms") or trace.get("elapsed_ms") or 0
+        agent_perf = slide.get("agent_perf") or trace.get("agent_perf") or {}
+        code_retries = slide.get("code_retries", trace.get("code_retries", 0)) or 0
+        total_elapsed += elapsed
+        total_code_retries += code_retries
+        per_slide.append(
+            {
+                "index": idx,
+                "elapsed_ms": elapsed,
+                "agent_perf": agent_perf,
+                "code_retries": code_retries,
+            }
+        )
+        for agent, stats in agent_perf.items():
+            bucket = agent_totals.setdefault(
+                agent, {"elapsed_ms": 0, "turns": 0, "retries": 0}
+            )
+            bucket["elapsed_ms"] += stats.get("elapsed_ms", 0)
+            bucket["turns"] += stats.get("turns", 0)
+            bucket["retries"] += stats.get("retries", 0)
+
+    return {
+        "per_slide": per_slide,
+        "agent_totals": agent_totals,
+        "total_slide_elapsed_ms": total_elapsed,
+        "total_code_retries": total_code_retries,
+    }
 
 STAGE_IDS = [s["id"] for s in PIPELINE_STAGES]
 STAGE_BY_ID = {s["id"]: s for s in PIPELINE_STAGES}
@@ -221,10 +264,13 @@ def save_pipeline_state(task_id: str, state: dict):
     json.dump(state, open(path, "w"), ensure_ascii=False, indent=2)
 
 
-def init_pipeline_state(task_id: str, generation_mode: str = "auto") -> dict:
+def init_pipeline_state(
+    task_id: str, generation_mode: str = "auto", page_mode: str = "fixed"
+) -> dict:
     state = {
         "task_id": task_api_id(task_id),
         "generation_mode": generation_mode,
+        "page_mode": page_mode,
         "awaiting_human": None,
         "started_at": time.time(),
         "elapsed_ms": 0,
@@ -256,6 +302,7 @@ class ProgressManager:
         task_id: str,
         run_dir: str,
         generation_mode: str = "auto",
+        page_mode: str = "fixed",
         debug: bool = True,
     ):
         self.task_id = task_id
@@ -264,7 +311,7 @@ class ProgressManager:
         self.failed = False
         self.pipeline_started_at = time.monotonic()
         self.stage_started_at: dict[str, float] = {}
-        self.state = init_pipeline_state(task_id, generation_mode)
+        self.state = init_pipeline_state(task_id, generation_mode, page_mode)
         self.current_stage_id: Optional[str] = None
 
     def _elapsed_ms(self) -> int:
@@ -304,8 +351,11 @@ class ProgressManager:
             self.state["stages"][stage_id]["status"] = stage_status
             if summary is not None:
                 self.state["stages"][stage_id]["summary"] = summary
-            if stage_status in ("completed", "failed"):
-                self.state["stages"][stage_id]["elapsed_ms"] = self._stage_elapsed_ms(stage_id)
+            stage_elapsed = self._stage_elapsed_ms(stage_id)
+            if stage_status in ("running", "waiting") and stage_elapsed is not None:
+                self.state["stages"][stage_id]["elapsed_ms"] = stage_elapsed
+            elif stage_status in ("completed", "failed"):
+                self.state["stages"][stage_id]["elapsed_ms"] = stage_elapsed
 
         save_pipeline_state(self.task_id, self.state)
 
@@ -360,6 +410,7 @@ class ProgressManager:
             self.state["slide_gen"].update(sub)
         else:
             self.state.setdefault("stage_subprogress", {})[stage_id] = sub
+        self.state["elapsed_ms"] = self._elapsed_ms()
         save_pipeline_state(self.task_id, self.state)
         websocket = active_connections.get(self.task_id)
         if websocket is None:
@@ -414,15 +465,28 @@ async def run_blocking_with_heartbeat(
     *args,
     interval_sec: float = 3.0,
     message: str = "处理中...",
+    timeout_sec: Optional[float] = None,
     **kwargs,
 ):
-    """Run blocking work in a thread while keeping the event loop alive for progress updates."""
+    """Run blocking work in a thread while keeping the event loop alive for progress updates.
+
+    If timeout_sec is set and exceeded, raises TimeoutError. Note: the underlying thread
+    cannot be force-killed (Python limitation); task.cancel() only detaches the await so the
+    pipeline fails gracefully, and the orphaned thread finishes on its own.
+    """
     task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    start = time.monotonic()
     while not task.done():
         await progress.report_subprogress(
             stage_id,
             {"message": message, "running": True},
         )
+        if timeout_sec is not None and (time.monotonic() - start) > timeout_sec:
+            task.cancel()
+            raise TimeoutError(
+                f"PDF 解析超过 {int(timeout_sec)} 秒仍未完成，已中止。"
+                "请确认文档未损坏，或调大 PDF_PARSE_TIMEOUT_SEC。"
+            )
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout=interval_sec)
         except asyncio.TimeoutError:
@@ -562,17 +626,26 @@ async def create_task(
     pptxFile: UploadFile = File(None),
     pdfFile: UploadFile = File(None),
     topic: str = Form(None),
-    numberOfPages: int = Form(...),
+    numberOfPages: int | None = Form(None),
+    pageMode: str = Form("fixed"),
     generationMode: str = Form("auto"),
     useDefaultPptx: bool = Form(False),
 ):
     if generationMode not in ("auto", "ask"):
         raise HTTPException(status_code=400, detail="generationMode must be auto or ask")
+    if pageMode not in ("fixed", "auto"):
+        raise HTTPException(status_code=400, detail="pageMode must be fixed or auto")
+    if pageMode == "fixed":
+        if numberOfPages is None or not (1 <= numberOfPages <= 100):
+            raise HTTPException(
+                status_code=400, detail="numberOfPages must be between 1 and 100"
+            )
     task_id = datetime.now().strftime("20%y-%m-%d") + "/" + str(uuid.uuid4())
     logger.info(f"task created: {task_id}")
     os.makedirs(pjoin(RUNS_DIR, task_id))
     task = {
-        "numberOfPages": numberOfPages,
+        "pageMode": pageMode,
+        "numberOfPages": numberOfPages if pageMode == "fixed" else None,
         "generationMode": generationMode,
     }
     if pptxFile is not None:
@@ -946,7 +1019,12 @@ async def ppt_gen(task_id: str, rerun=False):
     ppt_image_folder = pjoin(pptx_config.RUN_DIR, "slide_images")
 
     generation_mode = task.get("generationMode", "auto")
-    progress = ProgressManager(task_id, generation_config.RUN_DIR, generation_mode)
+    page_mode = task.get("pageMode", "fixed")
+    progress = ProgressManager(
+        task_id, generation_config.RUN_DIR, generation_mode, page_mode
+    )
+    planner_role = "planner_auto" if page_mode == "auto" else "planner"
+    num_slides = None if page_mode == "auto" else task["numberOfPages"]
 
     try:
         # --- init ---
@@ -955,7 +1033,8 @@ async def ppt_gen(task_id: str, rerun=False):
         await progress.report_stage_complete(
             "init",
             {
-                "numberOfPages": task["numberOfPages"],
+                "pageMode": page_mode,
+                "numberOfPages": task.get("numberOfPages"),
                 "generationMode": task.get("generationMode", "auto"),
                 "pptx": task["pptx"],
                 "pdf": task["pdf"],
@@ -1023,7 +1102,8 @@ async def ppt_gen(task_id: str, rerun=False):
                 pjoin(RUNS_DIR, "pdf", pdf_md5, "source.pdf"),
                 parsedpdf_dir,
                 models.marker_model,
-                message="marker-pdf 正在解析 PDF（CPU 占用较高，请耐心等待）",
+                message="marker-pdf 正在解析 PDF（已启用 GPU 加速）",
+                timeout_sec=PDF_PARSE_TIMEOUT_SEC,
             )
         else:
             text_content = open(pjoin(parsedpdf_dir, "source.md")).read()
@@ -1167,10 +1247,9 @@ async def ppt_gen(task_id: str, rerun=False):
                 )
                 planner_turns = [
                     turn.to_dict()
-                    for turn in ppt_agent.staffs["planner"].history
+                    for turn in ppt_agent.staffs[planner_role].history
                 ]
                 save_agent_trace(task_id, "planner", {"turns": planner_turns})
-                await progress.report_stage_start("outline")
                 await progress.report_subprogress(
                     "outline",
                     {
@@ -1191,6 +1270,7 @@ async def ppt_gen(task_id: str, rerun=False):
                     {
                         "total_slides": len(outline),
                         "outline_preview": outline[:5],
+                        "planner_elapsed_ms": data.get("elapsed_ms"),
                     },
                 )
                 await progress.report_stage_start("slide_gen")
@@ -1219,6 +1299,9 @@ async def ppt_gen(task_id: str, rerun=False):
                         "section": data["section"],
                         "success": data["success"],
                         "error": data.get("error"),
+                        "elapsed_ms": data.get("elapsed_ms"),
+                        "agent_perf": data.get("agent_perf"),
+                        "code_retries": data.get("code_retries", 0),
                     }
                 )
                 slide_gen_slides.sort(key=lambda x: x["index"])
@@ -1230,22 +1313,29 @@ async def ppt_gen(task_id: str, rerun=False):
                         "total": data["total"],
                         "current_purpose": data["purpose"],
                         "elapsed_ms": data.get("elapsed_ms", 0),
+                        "perf": aggregate_slide_gen_perf(
+                            slide_gen_slides, live_slide_traces
+                        ),
                     },
                 )
 
+        await progress.report_stage_start("outline")
         prs, gen_history = await ppt_agent.generate_pres(
             source_doc=source_doc,
-            num_slides=task["numberOfPages"],
+            num_slides=num_slides,
             on_progress=on_pptgen_progress,
         )
         save_agent_trace(task_id, "slide_gen", gen_history)
         success_count = sum(1 for s in slide_gen_slides if s.get("success"))
+        slide_perf = aggregate_slide_gen_perf(slide_gen_slides, live_slide_traces)
+        progress.state["slide_gen"]["perf"] = slide_perf
         await progress.report_stage_complete(
             "slide_gen",
             {
                 "completed": len(slide_gen_slides),
                 "success_count": success_count,
                 "total": len(slide_gen_slides),
+                "perf": slide_perf,
             },
         )
 

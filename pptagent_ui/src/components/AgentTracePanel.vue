@@ -11,9 +11,20 @@
         <label>页码：</label>
         <select v-model.number="selectedSlideIndex">
           <option v-for="slide in perSlide" :key="slide.index" :value="slide.index">
-            第 {{ slide.index }} 页 — {{ truncate(slide.purpose, 40) }}
+            {{ slideOptionLabel(slide) }}
           </option>
         </select>
+      </div>
+
+      <div v-if="isSlideGen && activeSlideAgentPerf.length" class="slide-perf-inline">
+        <span
+          v-for="item in activeSlideAgentPerf"
+          :key="item.name"
+          class="slide-perf-chip"
+        >
+          {{ item.name }} {{ formatMs(item.elapsed_ms) }}
+          <span v-if="item.retries">· r{{ item.retries }}</span>
+        </span>
       </div>
 
       <div v-for="agentName in activeAgentNames" :key="agentName" class="agent-block">
@@ -34,6 +45,7 @@
           >
             <div class="turn-meta">
               <span>Turn #{{ turn.id }}</span>
+              <span v-if="turn.elapsed_ms" class="elapsed-badge">{{ formatMs(turn.elapsed_ms) }}</span>
               <span v-if="turn.retry >= 0" class="retry-badge">retry {{ turn.retry }}</span>
               <span v-if="turn.input_tokens" class="token-badge">
                 {{ turn.input_tokens }}→{{ turn.output_tokens }} tokens
@@ -117,6 +129,13 @@ export default {
       if (!traces.length) return null
       return traces.find((s) => s.index === this.selectedSlideIndex) || traces[0]
     },
+    activeSlideAgentPerf() {
+      const perf = this.activeSlideTrace?.agent_perf
+      if (!perf) return []
+      return Object.entries(perf)
+        .map(([name, stats]) => ({ name, ...stats }))
+        .sort((a, b) => (b.elapsed_ms || 0) - (a.elapsed_ms || 0))
+    },
     activeAgentNames() {
       if (this.isSlideGen && this.activeSlideTrace?.agents) {
         return Object.keys(this.activeSlideTrace.agents)
@@ -162,9 +181,24 @@ export default {
     },
   },
   methods: {
+    formatMs(ms) {
+      if (!ms && ms !== 0) return ''
+      const sec = Math.floor(ms / 1000)
+      if (sec >= 60) {
+        const min = Math.floor(sec / 60)
+        return `${min}m ${sec % 60}s`
+      }
+      if (sec > 0) return `${sec}s`
+      return `${ms}ms`
+    },
     truncate(text, len) {
       if (!text) return ''
       return text.length > len ? text.slice(0, len) + '...' : text
+    },
+    slideOptionLabel(slide) {
+      const base = `第 ${slide.index} 页 — ${this.truncate(slide.purpose, 40)}`
+      if (slide.elapsed_ms) return `${base} (${this.formatMs(slide.elapsed_ms)})`
+      return base
     },
     formatResponse(response) {
       if (typeof response !== 'string') return this.formatJson(response)
@@ -318,6 +352,27 @@ export default {
 
 .retry-badge {
   color: var(--color-warning);
+}
+
+.elapsed-badge {
+  color: var(--color-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.slide-perf-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.slide-perf-chip {
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
 }
 
 .token-badge {

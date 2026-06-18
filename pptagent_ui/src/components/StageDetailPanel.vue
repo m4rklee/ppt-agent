@@ -131,6 +131,7 @@
         :completed="slideGen.completed"
         :total="slideGen.total"
         :current-purpose="slideGen.current_purpose"
+        :perf="slideGenPerf"
       />
 
       <div v-if="stage.id === 'done' && stage.status === 'completed' && downloadLink" class="preview">
@@ -323,6 +324,39 @@ export default {
     currentFinalPreviewImage() {
       if (!this.finalPreview.images.length) return null
       return this.finalPreview.images[this.finalLightboxIndex] || null
+    },
+    slideGenPerf() {
+      if (this.slideGen?.perf) return this.slideGen.perf
+      if (this.stage?.summary?.perf) return this.stage.summary.perf
+      if (!this.liveSlideTraces.length) return null
+      const agentTotals = {}
+      const perSlide = []
+      let totalSlideElapsedMs = 0
+      let totalCodeRetries = 0
+      for (const trace of this.liveSlideTraces) {
+        const elapsed = trace.elapsed_ms || 0
+        totalSlideElapsedMs += elapsed
+        totalCodeRetries += trace.code_retries || 0
+        perSlide.push({
+          index: trace.index,
+          elapsed_ms: elapsed,
+          agent_perf: trace.agent_perf || {},
+          code_retries: trace.code_retries || 0,
+        })
+        for (const [agent, stats] of Object.entries(trace.agent_perf || {})) {
+          const bucket = agentTotals[agent] || { elapsed_ms: 0, turns: 0, retries: 0 }
+          bucket.elapsed_ms += stats.elapsed_ms || 0
+          bucket.turns += stats.turns || 0
+          bucket.retries += stats.retries || 0
+          agentTotals[agent] = bucket
+        }
+      }
+      return {
+        per_slide: perSlide,
+        agent_totals: agentTotals,
+        total_slide_elapsed_ms: totalSlideElapsedMs,
+        total_code_retries: totalCodeRetries,
+      }
     },
   },
   watch: {

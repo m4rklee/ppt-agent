@@ -59,17 +59,37 @@
       </div>
 
       <div class="form-group">
-        <label for="pages-input" class="field-label">目标页数</label>
+        <div class="field-label">目标页数</div>
+        <div class="mode-toggle" role="radiogroup" aria-label="目标页数">
+          <button
+            type="button"
+            :class="['mode-option', { active: pageMode === 'fixed' }]"
+            @click="pageMode = 'fixed'"
+          >
+            指定
+            <span>手动输入页数</span>
+          </button>
+          <button
+            type="button"
+            :class="['mode-option', { active: pageMode === 'auto' }]"
+            @click="pageMode = 'auto'"
+          >
+            自动
+            <span>AI 根据文档决定</span>
+          </button>
+        </div>
         <input
+          v-if="pageMode === 'fixed'"
           id="pages-input"
           v-model.number="selectedPages"
           type="number"
           min="1"
           max="100"
           step="1"
-          class="select-input"
+          class="select-input pages-input"
           placeholder="请输入页数，如 12"
         />
+        <p v-else class="file-hint">页数由 AI 根据文档结构与内容密度自动生成</p>
       </div>
 
       <div class="form-group">
@@ -147,6 +167,7 @@ export default {
       pptxFile: null,
       pdfFile: null,
       selectedPages: 6,
+      pageMode: 'fixed',
       generationMode: 'auto',
       errorMessage: '',
       submitting: false,
@@ -288,9 +309,11 @@ export default {
         this.errorMessage = '请先上传 PDF 文件'
         return
       }
-      if (!Number.isInteger(this.selectedPages) || this.selectedPages < 1 || this.selectedPages > 100) {
-        this.errorMessage = '目标页数请输入 1-100 的整数'
-        return
+      if (this.pageMode === 'fixed') {
+        if (!Number.isInteger(this.selectedPages) || this.selectedPages < 1 || this.selectedPages > 100) {
+          this.errorMessage = '目标页数请输入 1-100 的整数'
+          return
+        }
       }
 
       this.submitting = true
@@ -310,7 +333,10 @@ export default {
         formData.append('useDefaultPptx', 'true')
       }
       formData.append('pdfFile', this.pdfFile)
-      formData.append('numberOfPages', this.selectedPages)
+      formData.append('pageMode', this.pageMode)
+      if (this.pageMode === 'fixed') {
+        formData.append('numberOfPages', this.selectedPages)
+      }
       formData.append('generationMode', this.generationMode)
 
       try {
@@ -442,6 +468,10 @@ export default {
 .select-input:focus {
   outline: none;
   border-color: var(--color-primary);
+}
+
+.pages-input {
+  margin-top: 10px;
 }
 
 .mode-toggle {

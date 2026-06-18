@@ -8,6 +8,21 @@
       <div class="progress-fill" :style="{ width: percent + '%' }"></div>
     </div>
     <p v-if="currentPurpose && !allDone" class="current-slide">正在生成：{{ currentPurpose }}</p>
+
+    <div v-if="agentTotals.length" class="agent-perf-summary">
+      <h5>Agent 耗时汇总</h5>
+      <div v-for="item in agentTotals" :key="item.name" class="agent-perf-row">
+        <span class="agent-name">{{ item.name }}</span>
+        <span class="agent-stats">
+          {{ formatMs(item.elapsed_ms) }}
+          <span v-if="item.retries > 0" class="retry-count">· 重试 {{ item.retries }}</span>
+        </span>
+      </div>
+      <p v-if="totalCodeRetries > 0" class="code-retry-note">
+        代码执行重试合计 {{ totalCodeRetries }} 次
+      </p>
+    </div>
+
     <ul class="slide-list">
       <li
         v-for="slide in sortedSlides"
@@ -16,7 +31,10 @@
       >
         <span class="slide-idx">{{ slide.index }}</span>
         <span class="slide-purpose">{{ slide.purpose }}</span>
-        <span class="slide-state">{{ slideStateLabel(slide) }}</span>
+        <span class="slide-meta">
+          <span class="slide-time">{{ formatSlideMs(slide) }}</span>
+          <span class="slide-state">{{ slideStateLabel(slide) }}</span>
+        </span>
       </li>
     </ul>
   </div>
@@ -30,6 +48,7 @@ export default {
     completed: { type: Number, default: 0 },
     total: { type: Number, default: 0 },
     currentPurpose: { type: String, default: '' },
+    perf: { type: Object, default: null },
   },
   computed: {
     allDone() {
@@ -42,8 +61,32 @@ export default {
     sortedSlides() {
       return [...this.slides].sort((a, b) => a.index - b.index)
     },
+    agentTotals() {
+      const totals = this.perf?.agent_totals || {}
+      return Object.entries(totals)
+        .map(([name, stats]) => ({ name, ...stats }))
+        .sort((a, b) => (b.elapsed_ms || 0) - (a.elapsed_ms || 0))
+    },
+    totalCodeRetries() {
+      return this.perf?.total_code_retries || 0
+    },
   },
   methods: {
+    formatMs(ms) {
+      if (!ms && ms !== 0) return '--'
+      const sec = Math.floor(ms / 1000)
+      if (sec >= 60) {
+        const min = Math.floor(sec / 60)
+        return `${min} 分 ${sec % 60} 秒`
+      }
+      if (sec > 0) return `${sec} 秒`
+      return `${ms} ms`
+    },
+    formatSlideMs(slide) {
+      const perfEntry = this.perf?.per_slide?.find((item) => item.index === slide.index)
+      const ms = slide.elapsed_ms ?? perfEntry?.elapsed_ms
+      return ms != null ? this.formatMs(ms) : ''
+    },
     slideStatus(slide) {
       if (slide.success === true) return 'success'
       if (slide.success === false) return 'failed'
@@ -95,6 +138,47 @@ export default {
   margin: 10px 0 8px;
 }
 
+.agent-perf-summary {
+  margin: 12px 0;
+  padding: 10px 12px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.agent-perf-summary h5 {
+  margin: 0 0 8px;
+  font-size: 0.8rem;
+  color: var(--color-text-secondary);
+}
+
+.agent-perf-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.8rem;
+  padding: 4px 0;
+}
+
+.agent-name {
+  color: var(--color-text);
+}
+
+.agent-stats {
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.retry-count {
+  color: var(--color-warning);
+}
+
+.code-retry-note {
+  margin: 8px 0 0;
+  font-size: 0.75rem;
+  color: var(--color-text-secondary);
+}
+
 .slide-list {
   list-style: none;
   margin: 0;
@@ -125,5 +209,18 @@ export default {
 
 .slide-purpose {
   color: var(--color-text);
+}
+
+.slide-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+.slide-time {
+  font-size: 0.75rem;
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
 }
 </style>

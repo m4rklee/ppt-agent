@@ -27,6 +27,8 @@
           :stages="timelineStages"
           :elapsed-ms="elapsedMs"
           :selected-id="selectedStageId"
+          :running-stage-id="runningStageId"
+          :running-stage-elapsed-ms="runningStageElapsedMs"
           @select="onSelectStage"
         />
       </aside>
@@ -83,7 +85,11 @@ export default {
       elapsedBaseAt: null,
       timelineStages: DEFAULT_STAGES.map((s) => ({ ...s })),
       selectedStageId: null,
-      slideGen: { slides: [], completed: 0, total: 0, current_purpose: '' },
+      runningStageId: null,
+      runningStageElapsedMs: 0,
+      runningStageBaseMs: 0,
+      runningStageBaseAt: null,
+      slideGen: { slides: [], completed: 0, total: 0, current_purpose: '', perf: null },
       stageMessage: '',
       stageMessageStageId: null,
       liveAgentTrace: null,
@@ -154,7 +160,7 @@ export default {
           status: fromState.status || 'pending',
           elapsed_ms: fromState.elapsed_ms,
           summary: fromState.summary,
-          cached: fromState.cached,
+          cached: fromState.cached ?? fromState.summary?.cached ?? false,
           agents: fromState.agents || def.agents || [],
         }
       })
@@ -164,6 +170,7 @@ export default {
           completed: pipeline.slide_gen.completed || 0,
           total: pipeline.slide_gen.total || 0,
           current_purpose: pipeline.slide_gen.current_purpose || '',
+          perf: pipeline.slide_gen.perf || null,
         }
       }
       const allDone = this.timelineStages.find((s) => s.id === 'done')?.status === 'completed'
@@ -186,13 +193,14 @@ export default {
         this.statusMessage = `${failedStage.label} 失败`
         this.selectedStageId = failedStage.id
       } else {
-        if (pipeline.elapsed_ms != null && !this.elapsedFrozen) {
-          this.syncElapsed(pipeline.elapsed_ms)
-        }
         const running = this.timelineStages.find((s) => s.status === 'running')
         if (running) {
           this.selectedStageId = running.id
+          if (this.runningStageId !== running.id) {
+            this.syncRunningStage(running.id, running.elapsed_ms)
+          }
         } else {
+          this.clearRunningStage()
           const waiting = this.timelineStages.find((s) => s.status === 'waiting')
           if (waiting) {
             this.selectedStageId = waiting.id
@@ -211,13 +219,29 @@ export default {
           if (this.elapsedBaseAt != null && !this.elapsedFrozen) {
             this.elapsedMs = this.elapsedBaseMs + (Date.now() - this.elapsedBaseAt)
           }
+          if (this.runningStageBaseAt != null && !this.elapsedFrozen) {
+            this.runningStageElapsedMs =
+              this.runningStageBaseMs + (Date.now() - this.runningStageBaseAt)
+          }
         }, 1000)
       }
+    },
+    syncRunningStage(stageId, serverStageMs) {
+      if (this.elapsedFrozen || !stageId) return
+      this.runningStageId = stageId
+      this.runningStageBaseMs = serverStageMs || 0
+      this.runningStageBaseAt = Date.now()
+      this.runningStageElapsedMs = this.runningStageBaseMs
+    },
+    clearRunningStage() {
+      this.runningStageId = null
+      this.runningStageBaseAt = null
     },
     freezeElapsed(finalMs) {
       this.stopElapsedTimer()
       this.elapsedFrozen = true
       this.elapsedBaseAt = null
+      this.clearRunningStage()
       if (finalMs != null) {
         this.elapsedMs = finalMs
         this.elapsedBaseMs = finalMs
@@ -234,6 +258,9 @@ export default {
       try {
         const res = await this.$axios.get(`/api/task/${this.taskId}/pipeline`)
         this.applyPipeline(res.data)
+        if (res.data.elapsed_ms != null && !this.elapsedFrozen) {
+          this.syncElapsed(res.data.elapsed_ms)
+        }
       } catch (e) {
         console.warn('Failed to load pipeline state', e)
       }
@@ -292,13 +319,34 @@ export default {
 
       if (data.pipeline) {
         this.applyPipeline(data.pipeline)
-      } else if (data.stage_id) {
+      }
+      if (data.stage_id && data.stage_elapsed_ms != null) {
+        const idx = this.timelineStages.findIndex((s) => s.id === data.stage_id)
+        if (idx >= 0) {
+          this.timelineStages[idx].elapsed_ms = data.stage_elapsed_ms
+        }
+      } else if (data.stage_id && !data.pipeline) {
         const idx = this.timelineStages.findIndex((s) => s.id === data.stage_id)
         if (idx >= 0) {
           this.timelineStages[idx].status = data.stage_status
           if (data.summary) this.timelineStages[idx].summary = data.summary
           if (data.stage_elapsed_ms != null) {
             this.timelineStages[idx].elapsed_ms = data.stage_elapsed_ms
+          }
+        }
+      }
+
+      if (data.stage_id && !this.isDone) {
+        const stageStatus =
+          data.stage_status ||
+          this.timelineStages.find((s) => s.id === data.stage_id)?.status
+        if (stageStatus === 'running') {
+          if (data.stage_elapsed_ms != null || this.runningStageId !== data.stage_id) {
+            this.syncRunningStage(data.stage_id, data.stage_elapsed_ms)
+          }
+        } else if (stageStatus === 'completed' || stageStatus === 'failed') {
+          if (this.runningStageId === data.stage_id) {
+            this.clearRunningStage()
           }
         }
       }
@@ -334,6 +382,7 @@ export default {
             completed: data.subprogress.completed || 0,
             total: data.subprogress.total || 0,
             current_purpose: data.subprogress.current_purpose || '',
+            perf: data.subprogress.perf || this.slideGen.perf || null,
           }
           if (!this.isDone) {
             this.selectedStageId = 'slide_gen'
